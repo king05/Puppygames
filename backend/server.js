@@ -109,3 +109,108 @@ io.on('connection', (socket) => {
 server.listen(PORT, () => {
   console.log(`Backend läuft auf Port ${PORT}`);
 });
+
+// --- CSV EXPORT ENDPUNKTE ---
+
+// 1. Gesamtergebnisse & Punktestände als CSV exportieren
+app.get('/api/admin/export/results.csv', authenticateToken, (req, res) => {
+  const leaderboard = calculateLeaderboard();
+  const stations = db.prepare('SELECT * FROM stations').all();
+
+  // Dynamic CSV Header: Rang, Startnummer, Name, Gesamtpunkte, [Station 1 Raw], [Station 1 Pkt], ...
+  let csvHeaders = ['Rang', 'Startnummer', 'Name', 'Gesamtpunkte'];
+  stations.forEach(s => {
+    csvHeaders.push(`Station_${s.name}_Wert`);
+    csvHeaders.push(`Station_${s.name}_Punkte`);
+  });
+
+  let csvRows = [csvHeaders.join(';')];
+
+  leaderboard.forEach(p => {
+    let row = [
+      p.overall_rank,
+      p.start_number,
+      `"${p.name.replace(/"/g, '""')}"`,
+      p.total_points
+    ];
+
+    stations.forEach(s => {
+      const details = p.station_details[s.id];
+      if (details) {
+        row.push(details.raw_value);
+        row.push(details.points);
+      } else {
+        row.push('');
+        row.push('');
+      }
+    });
+
+    csvRows.push(row.join(';'));
+  });
+
+  const csvContent = '\uFEFF' + csvRows.join('\n'); // UTF-8 BOM für Excel
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="puppygames_ergebnisse.csv"');
+  res.status(200).send(csvContent);
+});
+
+// 2. Teilnehmerliste als CSV-Vorlage / Backup exportieren
+app.get('/api/admin/export/participants.csv', authenticateToken, (req, res) => {
+  const participants = db.prepare('SELECT start_number, name FROM participants ORDER BY start_number ASC').all();
+  
+  let csvRows = ['Startnummer;Name'];
+  participants.forEach(p => {
+    csvRows.push(`${p.start_number};"${p.name.replace(/"/g, '""')}"`);
+  });
+
+  const csvContent = '\uFEFF' + csvRows.join('\n');
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="puppygames_teilnehmer.csv"');
+  res.status(200).send(csvContent);
+});
+
+// --- CSV IMPORT ENDPUNKT ---
+
+// Teilnehmer via CSV (Semikolon oder Komma getrennt) importieren
+app.post('/api/admin/import/participants', authenticateToken, (req, res) => {
+  const { csvText } = req.body;
+  if (!csvText) {
+    return res.status(400).json({ error: 'Kein CSV-Inhalt übergeben' });
+  }
+
+  const lines = csvText.split(/\r?\n/).filter(line => line.trim() !== '');
+  if (lines.length < 2) {
+    return res.status(400).json({ error: 'Die CSV-Datei enthält keine Datenzeilen.' });
+  }
+
+  let importedCount = 0;
+  let skippedCount = 0;
+
+  const insertStmt = db.prepare('INSERT OR IGNORE INTO participants (start_number, name) VALUES (?, ?)');
+
+  // Erste Zeile ist der Header
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+
+    // Trennzeichen ermitteln (Semikolon oder Komma)
+    const delimiter = line.includes(';') ? ';' : ',';
+    const parts = line.split(delimiter).map(p => p.trim().replace(/^"|"$/g, ''));
+
+    if (parts.length >= 2) {
+      const startNum = parseInt(parts[0], 10);
+      const name = parts[1];
+
+      if (!isNaN(startNum) && name) {
+        const info = insertStmt.run(startNum, name);
+        if (info.changes > 0) {
+          importedCount++;
+        } else {
+          skippedCount++; // Startnummer existiert bereits
+        }
+      }
+    }
+  }
+
+  res.json({ success: true, importedCount, skippedCount });
+});
