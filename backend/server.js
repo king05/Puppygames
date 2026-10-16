@@ -214,3 +214,56 @@ app.post('/api/admin/import/participants', authenticateToken, (req, res) => {
 
   res.json({ success: true, importedCount, skippedCount });
 });
+
+// --- NUTZERVERWALTUNG (NUR ADMIN) ---
+
+// 1. Alle Benutzer auflisten
+app.get('/api/admin/users', authenticateToken, (req, res) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Nur Admins dürfen Benutzer verwalten.' });
+  }
+
+  const users = db.prepare('SELECT id, username, role FROM users ORDER BY id ASC').all();
+  res.json(users);
+});
+
+// 2. Neuen Helfer oder Admin anlegen
+app.post('/api/admin/users', authenticateToken, (req, res) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Nur Admins dürfen Benutzer anlegen.' });
+  }
+
+  const { username, password, role } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Benutzername und Passwort sind erforderlich.' });
+  }
+
+  const userRole = role === 'admin' ? 'admin' : 'helper';
+  const passwordHash = bcrypt.hashSync(password, 10);
+
+  try {
+    const stmt = db.prepare('INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)');
+    const info = stmt.run(username.trim(), passwordHash, userRole);
+    res.json({ id: info.lastInsertRowid, username: username.trim(), role: userRole });
+  } catch (err) {
+    res.status(400).json({ error: 'Benutzername existiert bereits.' });
+  }
+});
+
+// 3. Benutzer löschen
+app.delete('/api/admin/users/:id', authenticateToken, (req, res) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Nur Admins dürfen Benutzer löschen.' });
+  }
+
+  const userId = parseInt(req.params.id, 10);
+
+  // Verhindern, dass sich der aktuell angemeldete Admin selbst löscht
+  if (userId === req.user.id) {
+    return res.status(400).json({ error: 'Du kannst deinen eigenen eigenen Account nicht löschen.' });
+  }
+
+  const stmt = db.prepare('DELETE FROM users WHERE id = ?');
+  stmt.run(userId);
+  res.json({ success: true });
+});
