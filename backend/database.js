@@ -56,3 +56,13 @@ if (userCount.count === 0) {
 }
 
 export default db;
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS stations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    scoring_type TEXT NOT NULL, -- 'points', 'time', 'guess'
+    target_value REAL DEFAULT NULL, -- Zielwert für Schätzspiele
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
