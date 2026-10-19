@@ -33,6 +33,14 @@ function authenticateToken(req, res, next) {
   });
 }
 
+// Admin Middleware
+function requireAdmin(req, res, next) {
+  if (req.user?.role !== 'admin') {
+    return res.status(403).json({ error: 'Nur Admins gestattet' });
+  }
+  next();
+}
+
 // --- AUTH ENDPUNKTE ---
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body;
@@ -44,17 +52,52 @@ app.post('/api/login', (req, res) => {
   res.json({ token, username: user.username, role: user.role });
 });
 
+// --- NUTZERVERWALTUNG (NUR ADMIN) ---
+app.get('/api/admin/users', authenticateToken, requireAdmin, (req, res) => {
+  const users = db.prepare('SELECT id, username, role FROM users ORDER BY id ASC').all();
+  res.json(users);
+});
+
+app.post('/api/admin/users', authenticateToken, requireAdmin, (req, res) => {
+  const { username, password, role } = req.body;
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Benutzername und Passwort erforderlich' });
+  }
+
+  const userRole = role === 'admin' ? 'admin' : 'helper';
+  const passwordHash = bcrypt.hashSync(password, 10);
+
+  try {
+    const stmt = db.prepare('INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)');
+    const info = stmt.run(username.trim(), passwordHash, userRole);
+    res.json({ id: info.lastInsertRowid, username: username.trim(), role: userRole });
+  } catch (err) {
+    res.status(400).json({ error: 'Benutzername existiert bereits' });
+  }
+});
+
+app.delete('/api/admin/users/:id', authenticateToken, requireAdmin, (req, res) => {
+  const userId = parseInt(req.params.id, 10);
+  if (userId === req.user.id) {
+    return res.status(400).json({ error: 'Eigenen Account löschen ist nicht erlaubt' });
+  }
+  db.prepare('DELETE FROM users WHERE id = ?').run(userId);
+  res.json({ success: true });
+});
+
 // --- STATIONS ENDPUNKTE ---
 app.get('/api/stations', (req, res) => {
   const stations = db.prepare('SELECT * FROM stations').all();
   res.json(stations);
 });
 
-app.post('/api/stations', authenticateToken, (req, res) => {
-  const { name, scoring_type, unit } = req.body;
-  const stmt = db.prepare('INSERT INTO stations (name, scoring_type, unit) VALUES (?, ?, ?)');
-  const info = stmt.run(name, scoring_type, unit || '');
-  res.json({ id: info.lastInsertRowid, name, scoring_type, unit });
+app.post('/api/stations', authenticateToken, requireAdmin, (req, res) => {
+  const { name, scoring_type, unit, target_value } = req.body;
+  const target = scoring_type === 'guess' ? (parseFloat(target_value) || 0) : null;
+
+  const stmt = db.prepare('INSERT INTO stations (name, scoring_type, unit, target_value) VALUES (?, ?, ?, ?)');
+  const info = stmt.run(name, scoring_type, unit || '', target);
+  res.json({ id: info.lastInsertRowid, name, scoring_type, unit, target_value: target });
 });
 
 // --- TEILNEHMER ENDPUNKTE ---
@@ -72,6 +115,94 @@ app.post('/api/participants', authenticateToken, (req, res) => {
   } catch (err) {
     res.status(400).json({ error: 'Startnummer vergeben oder Fehler beim Erstellen' });
   }
+});
+
+// --- CSV EXPORT & IMPORT ---
+app.get('/api/admin/export/results.csv', authenticateToken, requireAdmin, (req, res) => {
+  const leaderboard = calculateLeaderboard();
+  const stations = db.prepare('SELECT * FROM stations').all();
+
+  let csvHeaders = ['Rang', 'Startnummer', 'Name', 'Gesamtpunkte'];
+  stations.forEach(s => {
+    csvHeaders.push(`Station_${s.name}_Wert`);
+    csvHeaders.push(`Station_${s.name}_Punkte`);
+  });
+
+  let csvRows = [csvHeaders.join(';')];
+
+  leaderboard.forEach(p => {
+    let row = [
+      p.overall_rank,
+      p.start_number,
+      `"${p.name.replace(/"/g, '""')}"`,
+      p.total_points
+    ];
+
+    stations.forEach(s => {
+      const details = p.station_details[s.id];
+      if (details) {
+        row.push(details.raw_value);
+        row.push(details.points);
+      } else {
+        row.push('');
+        row.push('');
+      }
+    });
+
+    csvRows.push(row.join(';'));
+  });
+
+  const csvContent = '\uFEFF' + csvRows.join('\n');
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="puppygames_ergebnisse.csv"');
+  res.status(200).send(csvContent);
+});
+
+app.get('/api/admin/export/participants.csv', authenticateToken, requireAdmin, (req, res) => {
+  const participants = db.prepare('SELECT start_number, name FROM participants ORDER BY start_number ASC').all();
+  let csvRows = ['Startnummer;Name'];
+  participants.forEach(p => {
+    csvRows.push(`${p.start_number};"${p.name.replace(/"/g, '""')}"`);
+  });
+
+  const csvContent = '\uFEFF' + csvRows.join('\n');
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="puppygames_teilnehmer.csv"');
+  res.status(200).send(csvContent);
+});
+
+app.post('/api/admin/import/participants', authenticateToken, requireAdmin, (req, res) => {
+  const { csvText } = req.body;
+  if (!csvText) return res.status(400).json({ error: 'Kein CSV-Inhalt übergeben' });
+
+  const lines = csvText.split(/\r?\n/).filter(line => line.trim() !== '');
+  if (lines.length < 2) return res.status(400).json({ error: 'CSV enthält keine Datenzeilen' });
+
+  let importedCount = 0;
+  let skippedCount = 0;
+
+  const insertStmt = db.prepare('INSERT OR IGNORE INTO participants (start_number, name) VALUES (?, ?)');
+
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+
+    const delimiter = line.includes(';') ? ';' : ',';
+    const parts = line.split(delimiter).map(p => p.trim().replace(/^"|"$/g, ''));
+
+    if (parts.length >= 2) {
+      const startNum = parseInt(parts[0], 10);
+      const name = parts[1];
+
+      if (!isNaN(startNum) && name) {
+        const info = insertStmt.run(startNum, name);
+        if (info.changes > 0) importedCount++;
+        else skippedCount++;
+      }
+    }
+  }
+
+  res.json({ success: true, importedCount, skippedCount });
 });
 
 // --- PUNKTE EINGABE ---
@@ -108,162 +239,4 @@ io.on('connection', (socket) => {
 
 server.listen(PORT, () => {
   console.log(`Backend läuft auf Port ${PORT}`);
-});
-
-// --- CSV EXPORT ENDPUNKTE ---
-
-// 1. Gesamtergebnisse & Punktestände als CSV exportieren
-app.get('/api/admin/export/results.csv', authenticateToken, (req, res) => {
-  const leaderboard = calculateLeaderboard();
-  const stations = db.prepare('SELECT * FROM stations').all();
-
-  // Dynamic CSV Header: Rang, Startnummer, Name, Gesamtpunkte, [Station 1 Raw], [Station 1 Pkt], ...
-  let csvHeaders = ['Rang', 'Startnummer', 'Name', 'Gesamtpunkte'];
-  stations.forEach(s => {
-    csvHeaders.push(`Station_${s.name}_Wert`);
-    csvHeaders.push(`Station_${s.name}_Punkte`);
-  });
-
-  let csvRows = [csvHeaders.join(';')];
-
-  leaderboard.forEach(p => {
-    let row = [
-      p.overall_rank,
-      p.start_number,
-      `"${p.name.replace(/"/g, '""')}"`,
-      p.total_points
-    ];
-
-    stations.forEach(s => {
-      const details = p.station_details[s.id];
-      if (details) {
-        row.push(details.raw_value);
-        row.push(details.points);
-      } else {
-        row.push('');
-        row.push('');
-      }
-    });
-
-    csvRows.push(row.join(';'));
-  });
-
-  const csvContent = '\uFEFF' + csvRows.join('\n'); // UTF-8 BOM für Excel
-  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-  res.setHeader('Content-Disposition', 'attachment; filename="puppygames_ergebnisse.csv"');
-  res.status(200).send(csvContent);
-});
-
-// 2. Teilnehmerliste als CSV-Vorlage / Backup exportieren
-app.get('/api/admin/export/participants.csv', authenticateToken, (req, res) => {
-  const participants = db.prepare('SELECT start_number, name FROM participants ORDER BY start_number ASC').all();
-  
-  let csvRows = ['Startnummer;Name'];
-  participants.forEach(p => {
-    csvRows.push(`${p.start_number};"${p.name.replace(/"/g, '""')}"`);
-  });
-
-  const csvContent = '\uFEFF' + csvRows.join('\n');
-  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-  res.setHeader('Content-Disposition', 'attachment; filename="puppygames_teilnehmer.csv"');
-  res.status(200).send(csvContent);
-});
-
-// --- CSV IMPORT ENDPUNKT ---
-
-// Teilnehmer via CSV (Semikolon oder Komma getrennt) importieren
-app.post('/api/admin/import/participants', authenticateToken, (req, res) => {
-  const { csvText } = req.body;
-  if (!csvText) {
-    return res.status(400).json({ error: 'Kein CSV-Inhalt übergeben' });
-  }
-
-  const lines = csvText.split(/\r?\n/).filter(line => line.trim() !== '');
-  if (lines.length < 2) {
-    return res.status(400).json({ error: 'Die CSV-Datei enthält keine Datenzeilen.' });
-  }
-
-  let importedCount = 0;
-  let skippedCount = 0;
-
-  const insertStmt = db.prepare('INSERT OR IGNORE INTO participants (start_number, name) VALUES (?, ?)');
-
-  // Erste Zeile ist der Header
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i].trim();
-    if (!line) continue;
-
-    // Trennzeichen ermitteln (Semikolon oder Komma)
-    const delimiter = line.includes(';') ? ';' : ',';
-    const parts = line.split(delimiter).map(p => p.trim().replace(/^"|"$/g, ''));
-
-    if (parts.length >= 2) {
-      const startNum = parseInt(parts[0], 10);
-      const name = parts[1];
-
-      if (!isNaN(startNum) && name) {
-        const info = insertStmt.run(startNum, name);
-        if (info.changes > 0) {
-          importedCount++;
-        } else {
-          skippedCount++; // Startnummer existiert bereits
-        }
-      }
-    }
-  }
-
-  res.json({ success: true, importedCount, skippedCount });
-});
-
-// --- NUTZERVERWALTUNG (NUR ADMIN) ---
-
-// 1. Alle Benutzer auflisten
-app.get('/api/admin/users', authenticateToken, (req, res) => {
-  if (req.user.role !== 'admin') {
-    return res.status(403).json({ error: 'Nur Admins dürfen Benutzer verwalten.' });
-  }
-
-  const users = db.prepare('SELECT id, username, role FROM users ORDER BY id ASC').all();
-  res.json(users);
-});
-
-// 2. Neuen Helfer oder Admin anlegen
-app.post('/api/admin/users', authenticateToken, (req, res) => {
-  if (req.user.role !== 'admin') {
-    return res.status(403).json({ error: 'Nur Admins dürfen Benutzer anlegen.' });
-  }
-
-  const { username, password, role } = req.body;
-  if (!username || !password) {
-    return res.status(400).json({ error: 'Benutzername und Passwort sind erforderlich.' });
-  }
-
-  const userRole = role === 'admin' ? 'admin' : 'helper';
-  const passwordHash = bcrypt.hashSync(password, 10);
-
-  try {
-    const stmt = db.prepare('INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)');
-    const info = stmt.run(username.trim(), passwordHash, userRole);
-    res.json({ id: info.lastInsertRowid, username: username.trim(), role: userRole });
-  } catch (err) {
-    res.status(400).json({ error: 'Benutzername existiert bereits.' });
-  }
-});
-
-// 3. Benutzer löschen
-app.delete('/api/admin/users/:id', authenticateToken, (req, res) => {
-  if (req.user.role !== 'admin') {
-    return res.status(403).json({ error: 'Nur Admins dürfen Benutzer löschen.' });
-  }
-
-  const userId = parseInt(req.params.id, 10);
-
-  // Verhindern, dass sich der aktuell angemeldete Admin selbst löscht
-  if (userId === req.user.id) {
-    return res.status(400).json({ error: 'Du kannst deinen eigenen eigenen Account nicht löschen.' });
-  }
-
-  const stmt = db.prepare('DELETE FROM users WHERE id = ?');
-  stmt.run(userId);
-  res.json({ success: true });
 });
